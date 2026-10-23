@@ -161,22 +161,27 @@ def test_backpressure_single_worker_thread() -> None:
 
     Regression test for the per-message ``threading.Thread`` of the original observer: with a
     CUDA detector downstream each short-lived thread leaked ~1 MB (Jetson Orin Nano, 5 Hz:
-    +270 MB/min). 200 fast messages to a slow observer must be delivered by a single thread,
-    the last message must arrive, and intermediate messages must be dropped.
+    +270 MB/min). The first callback is held open while a burst of messages is submitted, so the
+    worker provably delivers at least two messages (the held one, then the latest of the burst)
+    on the same thread; intermediate messages are dropped.
     """
     from dimos.utils.reactive import _LatestBackpressureObserver
 
     received: list[int] = []
-    threads: set[int] = set()
-    done = threading.Event()
+    workers: list[threading.Thread] = []
+    first_started = threading.Event()
+    release_first = threading.Event()
+    burst_done = threading.Event()
 
     class Slow:
         def on_next(self, x: int) -> None:
-            threads.add(threading.get_ident())
-            time.sleep(0.005)
+            workers.append(threading.current_thread())
+            if x == 0:
+                first_started.set()
+                assert release_first.wait(5.0)
             received.append(x)
             if x == 199:
-                done.set()
+                burst_done.set()
 
         def on_error(self, e: Exception) -> None:
             raise AssertionError(e)
@@ -185,34 +190,42 @@ def test_backpressure_single_worker_thread() -> None:
             pass
 
     obs = _LatestBackpressureObserver(Slow(), idle_s=0.2)
-    for i in range(200):
-        obs.on_next(i)  # far faster than the observer consumes
-    assert done.wait(5.0), f"last message not delivered, got {received[-5:]}"
-    assert received[-1] == 199
-    assert len(received) < 200, "intermediate messages should have been dropped"
-    assert len(threads) == 1, f"expected one worker thread, saw {len(threads)}"
+    obs.on_next(0)
+    assert first_started.wait(5.0)
+    for i in range(1, 200):
+        obs.on_next(i)  # all submitted while the first callback is still running
+    release_first.set()
+    assert burst_done.wait(5.0), f"last message not delivered, got {received[-5:]}"
+    assert received == [0, 199], received  # held message, then only the latest of the burst
+    assert len(workers) == 2 and workers[0] is workers[1], (
+        "both deliveries must reuse the same worker"
+    )
     first_worker = obs._worker
-    assert first_worker is not None
+    assert first_worker is workers[0]
 
     # The worker is released when idle, and a later message starts a fresh one.
     time.sleep(0.6)
     assert obs._worker is None and not first_worker.is_alive()
-    done.clear()
+    burst_done.clear()
     obs.on_next(199)
-    assert done.wait(2.0)
-    assert obs._worker is not None and obs._worker is not first_worker
+    assert burst_done.wait(2.0)
+    assert workers[-1] is not first_worker
     obs.on_completed()
 
 
 def test_backpressure_error_delivered_once() -> None:
+    """Latest error wins: both errors are submitted while the worker is busy, only the last arrives."""
     from dimos.utils.reactive import _LatestBackpressureObserver
 
     errors: list[Exception] = []
+    busy = threading.Event()
+    release = threading.Event()
     got = threading.Event()
 
     class Sink:
         def on_next(self, x: int) -> None:
-            time.sleep(0.02)
+            busy.set()
+            assert release.wait(5.0)
 
         def on_error(self, e: Exception) -> None:
             errors.append(e)
@@ -223,8 +236,10 @@ def test_backpressure_error_delivered_once() -> None:
 
     obs = _LatestBackpressureObserver(Sink(), idle_s=0.2)
     obs.on_next(1)
+    assert busy.wait(5.0)
     obs.on_error(RuntimeError("a"))
-    obs.on_error(RuntimeError("b"))  # latest wins for errors too
+    obs.on_error(RuntimeError("b"))  # submitted while the worker is still busy: replaces "a"
+    release.set()
     assert got.wait(2.0)
     time.sleep(0.1)
     assert [str(e) for e in errors] == ["b"]
