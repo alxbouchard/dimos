@@ -204,7 +204,7 @@ def test_backpressure_single_worker_thread() -> None:
     assert first_worker is workers[0]
 
     # The worker is released when idle, and a later message starts a fresh one.
-    time.sleep(0.6)
+    first_worker.join(timeout=5.0)
     assert obs._worker is None and not first_worker.is_alive()
     burst_done.clear()
     obs.on_next(199)
